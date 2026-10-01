@@ -1,11 +1,11 @@
 // BanJiu-Guard - 机器学习检测引擎实现（LightGBM 静态库推理）
 #include "yx_ml_engine.h"
+#include "yx_win_compat.h"     // OpenBinary / GetModuleFileNameW（两平台共用）
 
 #ifdef _WIN32
 #include <windows.h>
 #include <winnt.h>
 #else
-#include "yx_win_compat.h"
 #include "pe_image.h"
 #endif
 #include <fstream>

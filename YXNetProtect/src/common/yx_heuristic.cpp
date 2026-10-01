@@ -1,10 +1,10 @@
 // BanJiu-Guard - 启发式扫描引擎实现
 #include "yx_heuristic.h"
+#include "yx_win_compat.h"     // OpenBinary：两平台共用
 #ifdef _WIN32
 #include <windows.h>
 #include <winnt.h>
 #else
-#include "yx_win_compat.h"
 #include "pe_image.h"
 #endif
 #include <fstream>
