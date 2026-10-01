@@ -2,6 +2,7 @@
 [Yy]XNetProtect/build/
 [Yy]XNetProtect/src/driver/build/
 [Yy]XNetProtect/dist/
+/build/
 
 # LightGBM 第三方源码与编译产物（由 third_party/build_lightgbm.bat 本地构建）
 [Yy]XNetProtect/third_party/LightGBM/
@@ -13,6 +14,15 @@ cmake_install.cmake
 *.ninja
 .ninja_deps
 .ninja_log
+
+# CMake in-source 产物（推荐 out-of-source：cmake -S YXNetProtect -B build）
+[Yy]XNetProtect/.qt/
+[Yy]XNetProtect/Makefile
+[Yy]XNetProtect/**/Makefile
+[Yy]XNetProtect/src/gui/BanJiu-Guard
+[Yy]XNetProtect/src/gui/lib_lightgbm.so
+[Yy]XNetProtect/**/libyx_*.a
+[Yy]XNetProtect/src/gui/models/
 
 # MSVC
 *.obj

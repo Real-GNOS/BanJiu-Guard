@@ -84,8 +84,11 @@ if(WIN32)
         LINK_FLAGS "/MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\""
     )
 else()
-    # ---- Linux：运行时定位 lib_lightgbm.so（构建树或 exe 同目录）----
+    # ---- Linux：产物命名为 BanJiu-Guard.elf ----
+    # 说明：检测引擎按文件魔数（MZ / ELF）识别，不依赖扩展名，改名不影响检出
     set_target_properties(BanJiuGuard PROPERTIES
+        SUFFIX ".elf"
+        # ---- 运行时定位 lib_lightgbm.so（构建树或 exe 同目录）----
         BUILD_RPATH "$ORIGIN;${CMAKE_SOURCE_DIR}/third_party/LightGBM"
         INSTALL_RPATH "$ORIGIN"
     )

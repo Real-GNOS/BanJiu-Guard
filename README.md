@@ -136,8 +136,10 @@ cmake --build build -j"$(nproc)"
 
 产物：
 
-- `build/src/gui/BanJiu-Guard` —— GUI（内嵌实时防护服务）
+- `build/src/gui/BanJiu-Guard.elf` —— GUI 可执行文件（内嵌实时防护服务，Linux 产物统一带 `.elf` 后缀）
 - `build/src/gui/lib_lightgbm.so`、`build/src/gui/models/lgbm_detector.txt` —— 构建后自动拷贝到可执行文件旁
+
+> 说明：检测引擎按文件魔数（`MZ` / `\x7fELF`）识别可执行格式，不依赖扩展名，因此改名/无后缀样本同样能检出。
 
 > LightGBM 缺失时 CMake 自动降级（日志提示"ML 引擎已禁用，检测退化为纯启发式"），不影响编译。
 
@@ -145,15 +147,15 @@ cmake --build build -j"$(nproc)"
 
 ```bash
 # 普通运行：可扫描 / 隔离 / 日志，执行拦截降级为被动模式
-./build/src/gui/BanJiu-Guard
+./build/src/gui/BanJiu-Guard.elf
 
 # 启用实时执行拦截 —— 方式一：root 运行
 sudo env DISPLAY="$DISPLAY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-     ./build/src/gui/BanJiu-Guard
+     ./build/src/gui/BanJiu-Guard.elf
 
 # 方式二（推荐）：授予文件能力，之后普通运行即可拦截
 sudo setcap cap_sys_admin,cap_dac_read_search,cap_dac_override+ep \
-     ./build/src/gui/BanJiu-Guard
+     ./build/src/gui/BanJiu-Guard.elf
 ```
 
 也可以在 GUI「设置 → 启用完全防护」中一键授权（内部调用 `pkexec setcap`，需要 polkit 与 `libcap2-bin`）。

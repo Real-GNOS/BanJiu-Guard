@@ -39,7 +39,7 @@ jobs:
         # 运行 10 秒未崩溃即视为通过（timeout 返回 124 表示仍在正常运行）
         run: |
           set +e
-          timeout 10 ./build/src/gui/BanJiu-Guard
+          timeout 10 ./build/src/gui/BanJiu-Guard.elf
           rc=$?
           set -e
           test "$rc" -eq 124
@@ -49,7 +49,7 @@ jobs:
         with:
           name: BanJiu-Guard-linux
           path: |
-            build/src/gui/BanJiu-Guard
+            build/src/gui/BanJiu-Guard.elf
             build/src/gui/lib_lightgbm.so
             build/src/gui/models/
           if-no-files-found: error
