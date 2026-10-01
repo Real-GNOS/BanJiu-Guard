@@ -2,6 +2,9 @@
 
 一个完整可运行的 C++/Qt + WDK 杀毒软件工程，针对"银狐"木马的增强防护。
 
+> **本分支 `linux-port` 为 Linux 移植版**：内核 Minifilter 驱动 → 用户态 `fanotify` 执行前同步拦截，SCM 系统服务 → GUI 内嵌服务 + systemd 用户单元，扫描引擎升级为 **PE + ELF 双格式**（W^X 违规段 / 节区熵 / 可疑动态符号）。Windows 原版的源码与构建方式在本分支保持不变，两平台共用同一套 GUI 与检测引擎代码。
+> 构建方式见下文 **[构建与运行（Linux 移植版）](#构建与运行linux-移植版)**。
+
 ## 项目结构
 
 ```
@@ -9,11 +12,13 @@ BanJiu-Guard/
 ├── CMakeLists.txt               # 顶层构建（GUI + 服务 + 公共库）
 ├── src/
 │   ├── common/                  # 公共库
-│   │   ├── yx_protocol.h        #   内核↔用户态通信协议（YX_EVENT/YX_DECISION 结构体）
+│   │   ├── yx_protocol.h        #   内核↔用户态通信协议（YX_EVENT/YX_DECISION 结构体，跨平台）
 │   │   ├── yx_yinhu_db.h        #   银狐木马特征库/IOC/规则分类
 │   │   ├── yx_rules.h/.cpp      #   行为规则引擎（注册表持久化/注入/任务计划/C2/BYOVD）
-│   │   ├── yx_heuristic.h/.cpp  #   PE 启发式扫描引擎（节区熵/可疑导入/加壳/签名缺失）
+│   │   ├── yx_heuristic.h/.cpp  #   启发式扫描引擎（PE：节区熵/可疑导入/加壳；ELF：W^X/熵/符号）
 │   │   ├── yx_ml_engine.h/.cpp  #   机器学习引擎（LightGBM 22维PE特征推理 + 分数融合）
+│   │   ├── yx_win_compat.h      #   [Linux] Win32 类型与少量 API 的可移植实现
+│   │   ├── pe_image.h           #   [Linux] 可移植 PE 结构定义（等价 winnt.h）
 │   │   └── CMakeLists.txt
 │   ├── driver/                  # 内核驱动（WDK Minifilter）
 │   │   ├── yx_driver.cpp        #   DriverEntry + Minifilter 注册 + 通信端口
@@ -23,6 +28,9 @@ BanJiu-Guard/
 │   ├── service/                 # 实时防护服务（用户态）
 │   │   ├── yx_service.h/.cpp    #   驱动通信 + 事件处置 + 隔离 + 启发式扫描集成
 │   │   ├── yx_first_run.h/.cpp  #   首次运行 + 测试模式引导
+│   │   ├── linux/               #   [Linux] fanotify 实现（同 API 的服务/引导实现）
+│   │   │   ├── yx_service_linux.cpp    # 执行拦截 + C2/持久化轮询 + 隔离/处置
+│   │   │   └── yx_first_run_linux.cpp  # setcap 授权 + XDG autostart
 │   │   └── CMakeLists.txt
 │   └── gui/                     # Qt GUI（静态 MSVC）
 │       ├── main.cpp             #   入口
@@ -34,8 +42,12 @@ BanJiu-Guard/
 │       └── CMakeLists.txt
 ├── tools/
 │   └── sign_driver.bat          # 驱动测试签名脚本
+├── systemd/
+│   └── banjiu-guard.service     # [Linux] systemd 用户单元模板
+├── .github/workflows/ci.yml     # [Linux] GitHub Actions：Ubuntu 构建 + 无头冒烟测试
 ├── third_party/
-│   └── build_lightgbm.bat       # LightGBM 4.6.0 静态库一键构建（自动 clone + /MT 编译）
+│   ├── build_lightgbm.bat       # LightGBM 4.6.0 静态库一键构建（自动 clone + /MT 编译）
+│   └── build_lightgbm_linux.sh  # [Linux] LightGBM 共享库一键构建（自动 clone + 子模块）
 ├── models/
 │   └── lgbm_detector.txt        # LightGBM 预训练模型权重（22维PE特征，二分类）
 └── signatures/                  # 特征库签名（预留）
@@ -99,7 +111,101 @@ BanJiu-Guard/
 - **C2 网络通信**：公开披露的银狐 C2 IP 拦截
 - **BYOVD 攻击**：易滥用驱动黑名单
 
-## 构建
+## 构建与运行（Linux 移植版）
+
+### 前提
+
+- Ubuntu 22.04+ / Debian 12+ 或其它自带 Qt6 的发行版
+- CMake ≥ 3.16、g++（C++17）、Ninja（可选）
+- 联网（首次需要克隆 LightGBM 源码）
+
+```bash
+sudo apt-get install -y cmake g++ ninja-build qt6-base-dev qt6-base-dev-tools
+```
+
+### 一键构建
+
+```bash
+# 1) LightGBM（首次联网，产物 third_party/LightGBM/lib_lightgbm.so）
+bash YXNetProtect/third_party/build_lightgbm_linux.sh
+
+# 2) 配置 + 编译
+cmake -S YXNetProtect -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+```
+
+产物：
+
+- `build/src/gui/BanJiu-Guard` —— GUI（内嵌实时防护服务）
+- `build/src/gui/lib_lightgbm.so`、`build/src/gui/models/lgbm_detector.txt` —— 构建后自动拷贝到可执行文件旁
+
+> LightGBM 缺失时 CMake 自动降级（日志提示"ML 引擎已禁用，检测退化为纯启发式"），不影响编译。
+
+### 运行与授权
+
+```bash
+# 普通运行：可扫描 / 隔离 / 日志，执行拦截降级为被动模式
+./build/src/gui/BanJiu-Guard
+
+# 启用实时执行拦截 —— 方式一：root 运行
+sudo env DISPLAY="$DISPLAY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+     ./build/src/gui/BanJiu-Guard
+
+# 方式二（推荐）：授予文件能力，之后普通运行即可拦截
+sudo setcap cap_sys_admin,cap_dac_read_search,cap_dac_override+ep \
+     ./build/src/gui/BanJiu-Guard
+```
+
+也可以在 GUI「设置 → 启用完全防护」中一键授权（内部调用 `pkexec setcap`，需要 polkit 与 `libcap2-bin`）。
+
+启动日志出现 `[实时防护] fanotify 执行前同步拦截已启用` 即表示同步拦截生效；否则会打印 `errno` 并降级为被动模式（C2 连接与持久化项轮询仍然工作）。
+
+**实测效果**：对触发规则的样本（W^X 违规段 + 可疑动态符号，融合分 70），`execve` 直接返回 `Permission denied`，随后样本被自动隔离；`/bin/ls` 等正常程序不受影响。
+
+### 开机自启
+
+- **systemd 用户单元**：GUI「设置 → 驱动启动类型」在 Linux 上对应 systemd 用户服务，选择后自动生成 `~/.config/systemd/user/banjiu-guard.service` 并执行 `systemctl --user enable --now banjiu-guard`；
+- **XDG autostart**：设置页中的「开机自启」开关，写入 `~/.config/autostart/banjiu-guard.desktop`；
+- 单元模板：`YXNetProtect/systemd/banjiu-guard.service`。
+
+### 持久化位置（XDG 目录）
+
+| 内容 | Windows | Linux |
+| --- | --- | --- |
+| 配置 | `安装目录\config.ini` | `~/.config/BanJiu-Guard/config.ini` |
+| 隔离区 | `安装目录\Quarantine` | `~/.local/share/BanJiu-Guard/Quarantine` |
+| 威胁处置日志 | `安装目录\threat_process.log` | `~/.local/state/BanJiu-Guard/threat_process.log` |
+| 崩溃日志 | `安装目录\BanJiu-Guard-crash.log`（minidump） | `~/.local/state/BanJiu-Guard/BanJiu-Guard-crash.log`（backtrace） |
+
+### 与 Windows 版的对应关系
+
+| Windows | Linux 移植实现 |
+| --- | --- |
+| WDK Minifilter 驱动（进程/文件/注册表回调） | `fanotify(FAN_OPEN_EXEC_PERM)` 执行前同步拦截：内核在 `execve` 前询问用户态，命中即回 `FAN_DENY`，进程根本不创建 |
+| `GetExtendedTcpTable` 网络连接监控 | 解析 `/proc/net/tcp{,6}`，每 5 秒轮询银狐 C2 黑名单 |
+| `schtasks` 计划任务扫描 | 扫描 `cron*`、`/var/spool/cron`、`/etc/systemd/system`，并检测"下载即执行 / `/dev/shm/`"特征 |
+| SCM 服务 + 驱动启动类型 | systemd 用户单元（`systemctl --user enable/disable`） |
+| UAC `requireAdministrator` 清单 | root 运行或 `setcap` 文件能力（GUI「启用完全防护」调用 pkexec） |
+| 注册表 `HasRunBefore` 标记 | `~/.config/BanJiu-Guard/has_run_before` 文件 |
+| `bcdedit /set testsigning on` | `pkexec setcap cap_sys_admin,...+ep <exe>`（授予 fanotify 所需能力） |
+| Authenticode 微软签名验证 | 不适用（Linux 无此机制，所有文件均参与扫描） |
+| `TerminateProcess` | `kill(pid, SIGKILL)` |
+| PE 启发式 | **PE + ELF 双格式**：ELF 检查 W^X 违规段、可执行节区熵、`ptrace`/`process_vm_writev`/`memfd_create` 等可疑符号 |
+
+**已知差异（v1 限制）**：
+
+- 文件落地实时扫描（minifilter 写入回调）暂未移植，落地文件由"执行前扫描 + 手动扫描"覆盖；
+- 持久化项（cron/systemd 条目）只上报、不自动删除，避免误删系统任务；
+- 脚本类样本（`#!/bin/sh` 等）不做结构化分析；
+- 无内核自保护：隔离区依赖 `0700` 权限与运行身份保护。
+
+### CI
+
+`.github/workflows/ci.yml` 在每次 push/PR 时于 Ubuntu 上完成：安装 Qt6 → 构建 LightGBM → 编译 → **无头冒烟测试**（`QT_QPA_PLATFORM=offscreen` 运行 10 秒不崩溃）→ 上传 `BanJiu-Guard-linux` 构件。
+
+---
+
+## 构建（Windows 原版）
 
 ### 前提
 - MSVC（VS 2019+，实测 VS 2026 / MSVC 14.51）

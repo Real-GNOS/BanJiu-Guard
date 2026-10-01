@@ -23,9 +23,13 @@
 #include <QPixmap>
 #include <QPainter>
 #include <QPainterPath>
+#include <QIcon>
+#ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#endif
 
+#ifdef _WIN32
 // ============================================================
 // NativeTrayIcon：用 Win32 Shell_NotifyIconW 原生 API 实现的托盘图标
 // 比 QSystemTrayIcon 更可靠——析构时同步调用 NIM_DELETE，不会残留
@@ -236,6 +240,52 @@ void NativeTrayIcon::onTrayCallback(HWND /*hwnd*/, UINT msg)
     }
 }
 
+#else // ------------------------------ !_WIN32 ------------------------------
+
+// ============================================================
+// NativeTrayIcon（Linux）：QSystemTrayIcon 实现的同名接口
+// GNOME/KDE/XFCE 等带系统托盘的环境可用；无托盘环境时程序仍可正常运行
+// ============================================================
+class NativeTrayIcon
+{
+public:
+    NativeTrayIcon()
+    {
+        m_tray = new QSystemTrayIcon();
+        QObject::connect(m_tray, &QSystemTrayIcon::activated,
+                         [this](QSystemTrayIcon::ActivationReason reason) {
+            if (reason != QSystemTrayIcon::Trigger &&
+                reason != QSystemTrayIcon::DoubleClick)
+                return;
+            // 左键：显示主窗口
+            for (QWidget* w : QApplication::topLevelWidgets()) {
+                if (qobject_cast<MainWindow*>(w)) {
+                    w->show();
+                    w->raise();
+                    break;
+                }
+            }
+        });
+    }
+
+    ~NativeTrayIcon() { delete m_tray; }
+
+    void setIcon(const QIcon& icon) { m_tray->setIcon(icon); }
+    void setToolTip(const QString& tip) { m_tray->setToolTip(tip); }
+    void show() { m_tray->show(); }
+    void hide() { m_tray->hide(); }
+    void showMessage(const QString& title, const QString& body)
+    {
+        m_tray->showMessage(title, body);
+    }
+    void setContextMenu(QMenu* menu) { m_tray->setContextMenu(menu); }
+
+private:
+    QSystemTrayIcon* m_tray = nullptr;
+};
+
+#endif // _WIN32
+
 // ============================================================
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
@@ -344,17 +394,8 @@ void MainWindow::buildTray()
 {
     m_tray = new NativeTrayIcon();
 
-    // 从 exe 嵌入的资源图标加载（app.rc 中 IDI_APP_ICON），与文件管理器显示的图标一致
-    HICON hIconBig = reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), L"IDI_APP_ICON", IMAGE_ICON, 256, 256, LR_SHARED));
-    HICON hIconSmall = reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), L"IDI_APP_ICON", IMAGE_ICON, 16, 16, LR_SHARED));
-    if (hIconBig) {
-        HWND hwnd = reinterpret_cast<HWND>(winId());
-        SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hIconBig));
-        if (hIconSmall) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIconSmall));
-        m_tray->setIcon(hIconBig);
-    }
-    if (!hIconBig) {
-        // 兜底：代码绘制盾牌图标
+    // 代码绘制的盾牌图标（资源图标缺失时的兜底；Linux 版统一使用）
+    auto makeShield = [] {
         QPixmap pix(64, 64);
         pix.fill(Qt::transparent);
         QPainter p(&pix);
@@ -383,10 +424,33 @@ void MainWindow::buildTray()
         p.setFont(f);
         p.drawText(pix.rect(), Qt::AlignCenter, "B");
         p.end();
+        return pix;
+    };
 
+#ifdef _WIN32
+    // 从 exe 嵌入的资源图标加载（app.rc 中 IDI_APP_ICON），与文件管理器显示的图标一致
+    HICON hIconBig = reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), L"IDI_APP_ICON", IMAGE_ICON, 256, 256, LR_SHARED));
+    HICON hIconSmall = reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), L"IDI_APP_ICON", IMAGE_ICON, 16, 16, LR_SHARED));
+    if (hIconBig) {
+        HWND hwnd = reinterpret_cast<HWND>(winId());
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hIconBig));
+        if (hIconSmall) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIconSmall));
+        m_tray->setIcon(hIconBig);
+    }
+    if (!hIconBig) {
+        // 兜底：代码绘制盾牌图标
+        QPixmap pix = makeShield();
         setWindowIcon(QIcon(pix));
         m_tray->setIcon(QIcon(pix).pixmap(64).toImage().toHICON());
     }
+#else
+    // Linux：无 .rc 资源脚本，窗口与托盘统一用绘制图标
+    {
+        QPixmap pix = makeShield();
+        setWindowIcon(QIcon(pix));
+        m_tray->setIcon(QIcon(pix));
+    }
+#endif
     m_tray->setToolTip("BanJiu-Guard 银狐防护");
 
     auto* menu = new QMenu(this);

@@ -5,37 +5,58 @@
 #include <QFont>
 #include <QFile>
 #include <QDateTime>
-#include <QWinEventNotifier>
-#include <windows.h>
-#include <dbghelp.h>
 #include <chrono>
 #include <fstream>
 #include <csignal>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <mutex>
 #include <string>
 #include "mainwindow.h"
 #include "../common/yx_protocol.h"
 
+#ifdef _WIN32
+#include <QWinEventNotifier>
+#include <windows.h>
+#include <dbghelp.h>
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <execinfo.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include "../common/yx_win_compat.h"
+#endif
+
 // ============================================================
-// 崩溃日志系统：未捕获异常时写 minidump + 调用栈到文件
+// 崩溃日志系统：未捕获异常时写转储/调用栈到文件
 // 不依赖 Qt 事件循环，崩溃时立即同步写入磁盘
 // ============================================================
 static std::wstring g_crashLogPath;
 static std::mutex   g_crashLogMutex;
 
 // 以 UTF-8 编码向日志文件追加一段文本（调用方需持有 g_crashLogMutex）
-// 必须用 ccs=UTF-8：std::wofstream 默认 C locale 无法编码中文，
-// 遇到中文字符会置 failbit，导致该行后续内容（含换行）全部丢失
 static void AppendLogUtf8(const std::wstring& text)
 {
+#ifdef _WIN32
+    // 必须用 ccs=UTF-8：std::wofstream 默认 C locale 无法编码中文，
+    // 遇到中文字符会置 failbit，导致该行后续内容（含换行）全部丢失
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, g_crashLogPath.c_str(), L"a, ccs=UTF-8") != 0 || !fp) return;
     fwprintf(fp, L"%s", text.c_str());
     fclose(fp);
+#else
+    FILE* fp = ::fopen(PathNarrow(g_crashLogPath).c_str(), "a");
+    if (!fp) return;
+    std::string u8 = PathNarrow(text);
+    fwrite(u8.data(), 1, u8.size(), fp);
+    fclose(fp);
+#endif
 }
+
+#ifdef _WIN32
 
 static void WriteCrashLog(const wchar_t* type, EXCEPTION_POINTERS* ep)
 {
@@ -85,12 +106,6 @@ static LONG WINAPI UnhandledExceptionFilterCb(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-static void TerminateHandlerCb()
-{
-    WriteCrashLog(L"std::terminate", nullptr);
-    std::abort();
-}
-
 static void PureCallHandlerCb()
 {
     WriteCrashLog(L"PureVirtualCall", nullptr);
@@ -101,12 +116,66 @@ static void InstallCrashHandlers(const std::wstring& logPath)
 {
     g_crashLogPath = logPath;
     SetUnhandledExceptionFilter(UnhandledExceptionFilterCb);
-    std::set_terminate(TerminateHandlerCb);
+    std::set_terminate([] { WriteCrashLog(L"std::terminate", nullptr); std::abort(); });
     _set_purecall_handler(PureCallHandlerCb);
     // SIGABRT / SIGSEGV
     signal(SIGABRT, [](int) { WriteCrashLog(L"SIGABRT", nullptr); std::abort(); });
     signal(SIGSEGV, [](int) { WriteCrashLog(L"SIGSEGV", nullptr); std::abort(); });
 }
+
+#else // ------------------------------ Linux ------------------------------
+
+// Linux：无 minidump，写信号名 + backtrace 调用栈
+static void WriteCrashLog(const wchar_t* type, void* /*ep*/)
+{
+    std::lock_guard<std::mutex> lk(g_crashLogMutex);
+    auto now = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz").toStdWString();
+    std::wstring body;
+    body += L"\n========================================\n";
+    body += L"[" + now + L"] CRASH: " + type + L"\n";
+    AppendLogUtf8(body);
+
+    void* frames[64];
+    int n = ::backtrace(frames, 64);
+    if (n > 0) {
+        // 回调中不能分配内存的约束在用户态 GUI 下可接受，直接走 symbols
+        char** syms = ::backtrace_symbols(frames, n);
+        if (syms) {
+            FILE* fp = ::fopen(PathNarrow(g_crashLogPath).c_str(), "a");
+            if (fp) {
+                for (int i = 0; i < n; i++)
+                    fprintf(fp, "  #%d %s\n", i, syms[i]);
+                fclose(fp);
+            }
+            free(syms);
+        }
+    }
+}
+
+static void InstallCrashHandlers(const std::wstring& logPath)
+{
+    g_crashLogPath = logPath;
+    std::set_terminate([] { WriteCrashLog(L"std::terminate", nullptr); std::abort(); });
+
+    struct sigaction sa{};
+    sa.sa_handler = [](int sig) {
+        const char* name = (sig == SIGSEGV) ? "SIGSEGV" :
+                           (sig == SIGABRT) ? "SIGABRT" : "SIGNAL";
+        wchar_t wname[32] = L"SIGNAL";
+        int i = 0;
+        for (; name[i] && i < 31; i++) wname[i] = (wchar_t)name[i];
+        wname[i] = L'\0';
+        WriteCrashLog(wname, nullptr);
+        ::_exit(128 + sig);
+    };
+    sa.sa_flags = SA_RESETHAND;
+    ::sigaction(SIGSEGV, &sa, nullptr);
+    ::sigaction(SIGABRT, &sa, nullptr);
+    ::sigaction(SIGBUS, &sa, nullptr);
+    ::sigaction(SIGFPE, &sa, nullptr);
+}
+
+#endif // _WIN32
 
 // 同步把消息写到崩溃日志文件（供 service 模块通过 extern 调用）
 extern "C" void YxWriteCrashLog(const wchar_t* msg)
@@ -117,6 +186,7 @@ extern "C" void YxWriteCrashLog(const wchar_t* msg)
     AppendLogUtf8(L"[" + now + L"] " + msg + L"\n");
 }
 
+#ifdef _WIN32
 // 静态链接 Qt 必须显式导入 platform plugins（否则找不到 qwindows）
 #include <QtPlugin>
 Q_IMPORT_PLUGIN(QWindowsIntegrationPlugin)
@@ -128,8 +198,10 @@ Q_IMPORT_PLUGIN(QICOPlugin)
 #pragma comment(linker, "/include:?qt_static_plugin_QWindowsIntegrationPlugin@@YA?BUQStaticPlugin@@XZ")
 #pragma comment(linker, "/include:?qt_static_plugin_QICOPlugin@@YA?BUQStaticPlugin@@XZ")
 #endif
+#endif // _WIN32
 
-// 防多开：命名互斥量 + 命名事件
+// 防多开：Windows 用命名互斥量 + 命名事件；Linux 用 flock 锁文件
+#ifdef _WIN32
 static constexpr const wchar_t* kInstanceMutex  = L"Global\\BanJiuGuard_InstanceMutex";
 static constexpr const wchar_t* kShowWindowEvent = L"Global\\BanJiuGuard_ShowWindowEvent";
 
@@ -155,21 +227,36 @@ static bool IsElevated()
     CloseHandle(tok);
     return ok;
 }
+#else
+static int g_instanceLockFd = -1;   // flock 持有，进程退出自动释放
+#endif
 
 int main(int argc, char *argv[])
 {
     // ---- 崩溃日志：尽早安装，确保后续任何崩溃都能捕获 ----
     {
+#ifdef _WIN32
         wchar_t exeDir[MAX_PATH];
         GetModuleFileNameW(nullptr, exeDir, MAX_PATH);
         std::wstring p(exeDir);
         auto pos = p.find_last_of(L"\\/");
         std::wstring dir = (pos == std::wstring::npos) ? L"." : p.substr(0, pos);
         std::wstring crashLog = dir + L"\\BanJiu-Guard-crash.log";
+#else
+        // Linux：日志放 XDG state 目录（安装到 /usr/local/bin 时该目录可写）
+        const char* st = ::getenv("XDG_STATE_HOME");
+        std::string stateDir = (st && *st) ? std::string(st)
+                                           : (std::string(::getenv("HOME") ? ::getenv("HOME") : "/tmp")
+                                              + "/.local/state");
+        stateDir += "/BanJiu-Guard";
+        ::mkdir(stateDir.c_str(), 0700);
+        std::wstring crashLog = PathWide(stateDir + "/BanJiu-Guard-crash.log");
+#endif
         InstallCrashHandlers(crashLog);
         YxWriteCrashLog(L"==== BanJiu-Guard start ====");
     }
 
+#ifdef _WIN32
     // ---- 管理员权限检查（双保险，manifest 已要求提权，这里再兜底）----
     if (!IsElevated()) {
         MessageBoxW(nullptr,
@@ -201,6 +288,34 @@ int main(int argc, char *argv[])
 
     // 创建显示窗口事件（供其他实例触发）
     HANDLE hShowEvt = CreateEventW(&sa, FALSE, FALSE, kShowWindowEvent);
+#else
+    // ---- Linux：不强制 root（GUI 可普通用户运行；实时拦截权限由
+    //      FirstRunManager 的 setcap/polkit 流程授予），仅提示 ----
+    if (::geteuid() != 0)
+        fprintf(stderr, "[提示] 当前非 root：fanotify 执行拦截需要特权，"
+                        "可在设置中「启用完全防护」授予文件能力。\n");
+
+    // ---- 防多开检测（flock 锁文件，进程退出自动释放）----
+    {
+        std::string lockPath;
+        const char* st = ::getenv("XDG_RUNTIME_DIR");
+        if (st && *st) {
+            lockPath = std::string(st) + "/banjiu-guard.lock";
+        } else {
+            const char* user = ::getenv("USER");
+            lockPath = std::string("/tmp/banjiu-guard-") + (user ? user : "user") + ".lock";
+        }
+        g_instanceLockFd = ::open(lockPath.c_str(), O_CREAT | O_RDWR, 0666);
+        if (g_instanceLockFd >= 0) {
+            if (::flock(g_instanceLockFd, LOCK_EX | LOCK_NB) != 0) {
+                // 已有实例在运行 → 交给窗口管理器聚焦既有窗口，自己退出
+                ::close(g_instanceLockFd);
+                g_instanceLockFd = -1;
+                return 0;
+            }
+        }
+    }
+#endif
 
 #if defined(QT_STATIC)
     // 静态链接时禁用 Qt 所有外部插件/库搜索路径。
@@ -231,6 +346,7 @@ int main(int argc, char *argv[])
 
     MainWindow w;
 
+#ifdef _WIN32
     // 监听显示窗口事件（其他实例发来的请求）
     if (hShowEvt) {
         auto* notifier = new QWinEventNotifier(hShowEvt, &app);
@@ -239,6 +355,7 @@ int main(int argc, char *argv[])
             ResetEvent(hShowEvt);
         });
     }
+#endif
 
     // 判断是否带自启参数
     bool autoStart = false;
@@ -258,7 +375,10 @@ int main(int argc, char *argv[])
 
     int ret = app.exec();
 
+#ifdef _WIN32
     if (hShowEvt) CloseHandle(hShowEvt);
     if (hMutex)   CloseHandle(hMutex);
+#endif
+    if (g_instanceLockFd >= 0) ::close(g_instanceLockFd);
     return ret;
 }

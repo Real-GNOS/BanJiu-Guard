@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux build (Qt6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qt6-base-dev qt6-base-dev-tools cmake g++ ninja-build
+
+      - name: Cache LightGBM
+        uses: actions/cache@v4
+        with:
+          path: YXNetProtect/third_party/LightGBM
+          key: lightgbm-${{ runner.os }}-v4.6.0
+
+      - name: Build LightGBM
+        run: bash YXNetProtect/third_party/build_lightgbm_linux.sh
+
+      - name: Configure
+        run: cmake -S YXNetProtect -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Smoke test (headless)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        # 运行 10 秒未崩溃即视为通过（timeout 返回 124 表示仍在正常运行）
+        run: |
+          set +e
+          timeout 10 ./build/src/gui/BanJiu-Guard
+          rc=$?
+          set -e
+          test "$rc" -eq 124
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BanJiu-Guard-linux
+          path: |
+            build/src/gui/BanJiu-Guard
+            build/src/gui/lib_lightgbm.so
+            build/src/gui/models/
+          if-no-files-found: error

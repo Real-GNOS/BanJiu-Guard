@@ -1,0 +1,33 @@
+# BanJiu-Guard systemd 用户单元（Linux 版）
+#
+# 安装方式一（推荐）：在 GUI「设置 → 驱动启动类型」中选择「自动启动」，
+#   程序会自动生成 ~/.config/systemd/user/banjiu-guard.service 并执行
+#   systemctl --user enable --now。
+#
+# 安装方式二（手动）：
+#   mkdir -p ~/.config/systemd/user
+#   cp banjiu-guard.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now banjiu-guard
+#
+# 说明：Qt 图形程序由 systemd --user 启动时通常没有 DISPLAY/WAYLAND_DISPLAY，
+#       下面的 Environment 做了常见会话的兜底；若托盘图标未出现，请改用
+#       桌面环境的 XDG autostart（GUI「开机自启」开关即是）。
+
+[Unit]
+Description=BanJiu-Guard real-time protection (fanotify)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# 执行拦截需要特权：以 root 运行，或给可执行文件授予
+#   sudo setcap cap_sys_admin,cap_dac_read_search,cap_dac_override+ep /path/to/BanJiu-Guard
+ExecStart=@EXE@ --autostart
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
