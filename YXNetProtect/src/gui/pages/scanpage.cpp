@@ -19,103 +19,55 @@
 #include <QStackedLayout>
 #include <QMessageBox>
 #include <QHeaderView>
+#ifdef _WIN32
 #include <windows.h>
 #include <wincrypt.h>
+#else
+#include "../../common/yx_win_compat.h"
+#include <sys/stat.h>
+#include <errno.h>
+#include <signal.h>
+#endif
+#include <QCryptographicHash>
+#include <QThread>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <mutex>
 
 extern "C" void YxWriteCrashLog(const wchar_t* msg);
 
-static QString ComputeSha1(const QString& filePath)
+// 跨平台文件哈希（Qt 实现，替代 Windows CryptoAPI，两平台结果一致）
+static QString ComputeFileHash(const QString& filePath, QCryptographicHash::Algorithm algo)
 {
     QFile f(filePath);
     if (!f.open(QIODevice::ReadOnly)) return QString();
 
-    HCRYPTPROV hProv = 0;
-    HCRYPTHASH hHash = 0;
-    QString result;
-
-    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        f.close();
-        return result;
-    }
-    if (!CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
-        CryptReleaseContext(hProv, 0);
-        f.close();
-        return result;
-    }
-
-    QByteArray buf;
+    QCryptographicHash hash(algo);
     while (!f.atEnd()) {
-        buf = f.read(1024 * 1024);
-        if (!CryptHashData(hHash, (BYTE*)buf.constData(), (DWORD)buf.size(), 0)) {
-            break;
-        }
+        QByteArray buf = f.read(1024 * 1024);
+        if (buf.isEmpty()) break;
+        hash.addData(buf);
     }
+    return QString::fromLatin1(hash.result().toHex());
+}
 
-    DWORD hashSize = 0;
-    DWORD len = sizeof(DWORD);
-    if (CryptGetHashParam(hHash, HP_HASHSIZE, (BYTE*)&hashSize, &len, 0) && hashSize > 0) {
-        QByteArray hashBuf(hashSize, 0);
-        DWORD hashLen = hashSize;
-        if (CryptGetHashParam(hHash, HP_HASHVAL, (BYTE*)hashBuf.data(), &hashLen, 0)) {
-            result = QString::fromLatin1(hashBuf.toHex());
-        }
-    }
-
-    CryptDestroyHash(hHash);
-    CryptReleaseContext(hProv, 0);
-    f.close();
-    return result;
+static QString ComputeSha1(const QString& filePath)
+{
+    return ComputeFileHash(filePath, QCryptographicHash::Sha1);
 }
 
 static QString ComputeMd5(const QString& filePath)
 {
-    QFile f(filePath);
-    if (!f.open(QIODevice::ReadOnly)) return QString();
-
-    HCRYPTPROV hProv = 0;
-    HCRYPTHASH hHash = 0;
-    QString result;
-
-    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        f.close();
-        return result;
-    }
-    if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
-        CryptReleaseContext(hProv, 0);
-        f.close();
-        return result;
-    }
-
-    QByteArray buf;
-    while (!f.atEnd()) {
-        buf = f.read(1024 * 1024);
-        if (!CryptHashData(hHash, (BYTE*)buf.constData(), (DWORD)buf.size(), 0)) {
-            break;
-        }
-    }
-
-    DWORD hashSize = 0;
-    DWORD len = sizeof(DWORD);
-    if (CryptGetHashParam(hHash, HP_HASHSIZE, (BYTE*)&hashSize, &len, 0) && hashSize > 0) {
-        QByteArray hashBuf(hashSize, 0);
-        DWORD hashLen = hashSize;
-        if (CryptGetHashParam(hHash, HP_HASHVAL, (BYTE*)hashBuf.data(), &hashLen, 0)) {
-            result = QString::fromLatin1(hashBuf.toHex());
-        }
-    }
-
-    CryptDestroyHash(hHash);
-    CryptReleaseContext(hProv, 0);
-    f.close();
-    return result;
+    return ComputeFileHash(filePath, QCryptographicHash::Md5);
 }
 
 // 威胁处理过程日志写入文件（独立于 UI 日志窗口），便于在 UI 卡死时排查
-// 路径：C:\BanJiu\threat_process.log
+// Windows：可执行文件目录\threat_process.log
+// Linux  ：$XDG_STATE_HOME/BanJiu-Guard/threat_process.log
 static std::wstring ThreatLogFile()
 {
+#ifdef _WIN32
     wchar_t exeBuf[MAX_PATH] = { 0 };
     GetModuleFileNameW(nullptr, exeBuf, MAX_PATH);
     std::wstring dir(exeBuf);
@@ -123,12 +75,22 @@ static std::wstring ThreatLogFile()
     if (pos != std::wstring::npos) dir = dir.substr(0, pos);
     else dir = L"C:\\BanJiu";
     return dir + L"\\threat_process.log";
+#else
+    const char* st = ::getenv("XDG_STATE_HOME");
+    std::string state = (st && *st)
+        ? std::string(st)
+        : (std::string(::getenv("HOME") ? ::getenv("HOME") : "/tmp") + "/.local/state");
+    state += "/BanJiu-Guard";
+    ::mkdir(state.c_str(), 0700);
+    return PathWide(state + "/threat_process.log");
+#endif
 }
 
 static void ThreatLog(const std::wstring& msg)
 {
     static std::mutex s_logMutex;
     std::lock_guard<std::mutex> lk(s_logMutex);
+#ifdef _WIN32
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, ThreatLogFile().c_str(), L"a, ccs=UTF-8") == 0 && fp) {
         SYSTEMTIME st;
@@ -140,6 +102,24 @@ static void ThreatLog(const std::wstring& msg)
         fputws(L"\n", fp);
         fclose(fp);
     }
+#else
+    FILE* fp = ::fopen(PathNarrow(ThreatLogFile()).c_str(), "a");
+    if (fp) {
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now.time_since_epoch()).count() % 1000;
+        struct tm tmv;
+        localtime_r(&t, &tmv);
+        fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)ms);
+        std::string line = PathNarrow(msg);
+        fwrite(line.data(), 1, line.size(), fp);
+        fputs("\n", fp);
+        fclose(fp);
+    }
+#endif
 }
 
 // ---------------- ScanWorker ----------------
@@ -325,11 +305,17 @@ void ThreatWorker::run(yx::ProtectionService* svc,
                 // 等待进程退出（缩短为最多 1.5 秒）
                 DWORD waitStart = GetTickCount();
                 for (int w = 0; w < 15; w++) {
+#ifdef _WIN32
                     HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
                     if (!h) break;
                     DWORD r = WaitForSingleObject(h, 100);
                     CloseHandle(h);
                     if (r == WAIT_OBJECT_0) break;
+#else
+                    // Linux：kill(pid, 0) 探测进程是否仍存在
+                    if (::kill((pid_t)pid, 0) != 0 && errno == ESRCH) break;
+                    QThread::msleep(100);
+#endif
                 }
                 ThreatLog(L"  Wait process exit elapsed " +
                           std::to_wstring(GetTickCount() - waitStart) + L"ms");

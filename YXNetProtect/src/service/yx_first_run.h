@@ -7,8 +7,12 @@
 //  5. 之后可在设置里点击"启用完全防护"重新触发
 #pragma once
 
-#include <windows.h>
 #include <string>
+
+#ifndef _WIN32
+// Linux：注册表/BCD/计划任务等概念不适用，相关静态方法在
+// linux/yx_first_run_linux.cpp 中给出跨平台等价实现或安全降级。
+#endif
 
 namespace yx {
 

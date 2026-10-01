@@ -7,7 +7,6 @@
 //  5. 自我保护（保护自身进程与安装目录）
 #pragma once
 
-#include <windows.h>
 #include <string>
 #include <functional>
 #include <memory>
@@ -17,6 +16,26 @@
 #include <filesystem>
 #include <set>
 #include <map>
+#include <condition_variable>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+// Linux：提供 Win32 基础类型（DWORD/ULONGLONG/HANDLE）与服务常量占位，
+// 使同一份类声明可在两个平台编译；实现分别见 yx_service.cpp / linux/yx_service_linux.cpp
+#include "../common/yx_win_compat.h"
+#ifndef INVALID_HANDLE_VALUE
+#define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
+#endif
+#ifndef SERVICE_BOOT_START
+#define SERVICE_BOOT_START    0
+#define SERVICE_SYSTEM_START  1
+#define SERVICE_AUTO_START    2
+#define SERVICE_DEMAND_START  3
+#define SERVICE_DISABLED      4
+#endif
+#endif // _WIN32
+
 #include "../common/yx_protocol.h"
 #include "../common/yx_rules.h"
 #include "../common/yx_heuristic.h"

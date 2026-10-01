@@ -1,15 +1,24 @@
 // BanJiu-Guard - 机器学习检测引擎实现（LightGBM 静态库推理）
 #include "yx_ml_engine.h"
+#include "yx_win_compat.h"     // OpenBinary / GetModuleFileNameW（两平台共用）
 
+#ifdef _WIN32
 #include <windows.h>
 #include <winnt.h>
+#else
+#include "pe_image.h"
+#endif
 #include <fstream>
 #include <vector>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 
+// LightGBM 机器学习推理：未启用（BANJIU_ML_ENABLED 未定义）时引擎降级为"模型不可用"，
+// 分数融合将自动退化为纯启发式（见 FuseScores），不影响其余功能。
+#ifdef BANJIU_ML_ENABLED
 #include <LightGBM/c_api.h>
+#endif
 
 namespace yx {
 
@@ -184,10 +193,12 @@ static int CountRichEntries(const uint8_t* base, size_t fileSize, LONG peOffset)
 MlEngine::MlEngine() {}
 
 MlEngine::~MlEngine() {
+#ifdef BANJIU_ML_ENABLED
     if (m_handle) {
         LGBM_BoosterFree((BoosterHandle)m_handle);
         m_handle = nullptr;
     }
+#endif
 }
 
 static std::wstring ExeDir() {
@@ -200,11 +211,12 @@ bool MlEngine::Load(const std::wstring& modelPath) {
     if (m_handle) return true;
 
     // 候选路径：显式指定，其次 exe 目录下 models 子目录，最后 exe 目录
+    // （跨平台：用 fs::path 拼接，避免硬编码分隔符）
     std::vector<std::wstring> candidates;
     if (!modelPath.empty()) candidates.push_back(modelPath);
     std::wstring dir = ExeDir();
-    candidates.push_back(dir + L"\\models\\" + kMlModelFileName);
-    candidates.push_back(dir + L"\\" + kMlModelFileName);
+    candidates.push_back((fs::path(dir) / "models" / std::wstring(kMlModelFileName)).wstring());
+    candidates.push_back((fs::path(dir) / std::wstring(kMlModelFileName)).wstring());
 
     std::string foundPath;
     for (const auto& p : candidates) {
@@ -222,6 +234,7 @@ bool MlEngine::Load(const std::wstring& modelPath) {
 
     if (foundPath.empty()) return false;
 
+#ifdef BANJIU_ML_ENABLED
     BoosterHandle handle = nullptr;
     int numIter = 0;
     int ret = LGBM_BoosterCreateFromModelfile(foundPath.c_str(), &numIter, &handle);
@@ -229,6 +242,10 @@ bool MlEngine::Load(const std::wstring& modelPath) {
 
     m_handle = handle;
     return true;
+#else
+    // 未启用 LightGBM：模型无法加载，引擎保持"不可用"状态
+    return false;
+#endif
 }
 
 MlResult MlEngine::ScanFile(const std::wstring& filePath) const {
@@ -236,7 +253,7 @@ MlResult MlEngine::ScanFile(const std::wstring& filePath) const {
     if (!m_handle) return result;
 
     // 读取整个文件
-    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    std::ifstream file = OpenBinary(filePath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) return result;
     size_t fileSize = (size_t)file.tellg();
     if (fileSize < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS)) return result;
@@ -335,6 +352,7 @@ MlResult MlEngine::ScanFile(const std::wstring& filePath) const {
         feat[21] = (double)(fileSize - maxRawEnd) / (double)fileSize;  // overlay_size_ratio
     }
 
+#ifdef BANJIU_ML_ENABLED
     // LightGBM 推理：row-major float64，NORMAL 预测（二分类返回 sigmoid 概率）
     int64_t outLen = 0;
     double outProb = 0.0;
@@ -352,6 +370,10 @@ MlResult MlEngine::ScanFile(const std::wstring& filePath) const {
     result.score = (int)(outProb * 100.0 + 0.5);
     if (result.score > 100) result.score = 100;
     return result;
+#else
+    (void)feat;   // 未启用 LightGBM：特征提取结果不参与推理
+    return result;
+#endif
 }
 
 // ---------------------------------------------------------------------------

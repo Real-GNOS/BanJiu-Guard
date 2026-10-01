@@ -28,6 +28,9 @@ private:
     // PE 结构分析
     bool AnalyzePe(const std::wstring& filePath, HeuristicResult& result) const;
 
+    // ELF 结构分析（Linux 可执行文件：W^X 违规段 / 可执行节区熵 / 可疑动态符号）
+    bool AnalyzeElf(const std::wstring& filePath, HeuristicResult& result) const;
+
     // 计算节区熵值（检测加壳）
     static double ComputeEntropy(const uint8_t* data, size_t size);
 

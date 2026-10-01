@@ -1,13 +1,19 @@
 // BanJiu-Guard - 启发式扫描引擎实现
 #include "yx_heuristic.h"
+#include "yx_win_compat.h"     // OpenBinary：两平台共用
+#ifdef _WIN32
 #include <windows.h>
 #include <winnt.h>
+#else
+#include "pe_image.h"
+#endif
 #include <fstream>
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <set>
 #include <cstring>
+#include <cwctype>
 
 namespace yx {
 
@@ -206,7 +212,7 @@ int HeuristicEngine::CheckPeAnomalies(const void* peBase, size_t fileSize, std::
 
 // PE 结构分析
 bool HeuristicEngine::AnalyzePe(const std::wstring& filePath, HeuristicResult& result) const {
-    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    std::ifstream file = OpenBinary(filePath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) return false;
 
     size_t fileSize = (size_t)file.tellg();
@@ -278,23 +284,214 @@ HeuristicResult HeuristicEngine::ScanFile(const std::wstring& filePath) const {
         std::transform(ext.begin(), ext.end(), ext.begin(), towlower);
     }
 
-    bool isExecutable = (ext == L".exe" || ext == L".dll" || ext == L".sys" ||
-                         ext == L".scr" || ext == L".ocx" || ext == L".cpl" ||
-                         ext == L".drv" || ext == L".efi");
+    bool isPeExt = (ext == L".exe" || ext == L".dll" || ext == L".sys" ||
+                    ext == L".scr" || ext == L".ocx" || ext == L".cpl" ||
+                    ext == L".drv" || ext == L".efi");
 
-    if (!isExecutable) {
-        result.suspicious = false;
-        result.score = 0;
+    // 按文件魔数分派（改名/无后缀的样本也能识别；PE 与 ELF 双格式）
+    unsigned char magic[4] = { 0 };
+    {
+        std::ifstream f = OpenBinary(filePath, std::ios::binary);
+        if (f.is_open()) f.read((char*)magic, 4);
+    }
+    bool isPe  = (magic[0] == 'M' && magic[1] == 'Z');
+    bool isElf = (magic[0] == 0x7F && magic[1] == 'E' &&
+                  magic[2] == 'L' && magic[3] == 'F');
+
+    if (isPe || isPeExt) {
+        if (!AnalyzePe(filePath, result)) {
+            result.suspicious = false;
+            result.score = 0;
+        }
         return result;
     }
 
-    // 分析 PE 结构
-    if (!AnalyzePe(filePath, result)) {
-        result.suspicious = false;
-        result.score = 0;
+    if (isElf) {
+        if (!AnalyzeElf(filePath, result)) {
+            result.suspicious = false;
+            result.score = 0;
+        }
+        return result;
     }
 
+    // 既非 PE 也非 ELF（脚本等）：不做结构化分析
+    result.suspicious = false;
+    result.score = 0;
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// ELF 分析（Linux 可执行文件）
+// ---------------------------------------------------------------------------
+namespace {
+
+// 可移植 ELF 结构（与 elf.h 布局一致）
+#pragma pack(push, 1)
+struct Elf64_Ehdr {
+    uint8_t  e_ident[16];
+    uint16_t e_type, e_machine;
+    uint32_t e_version;
+    uint64_t e_entry, e_phoff, e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+};
+struct Elf64_Phdr {
+    uint32_t p_type, p_flags;
+    uint64_t p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
+};
+struct Elf64_Shdr {
+    uint32_t sh_name, sh_type;
+    uint64_t sh_flags, sh_addr, sh_offset, sh_size;
+    uint32_t sh_link, sh_info;
+    uint64_t sh_addralign, sh_entsize;
+};
+struct Elf32_Ehdr {
+    uint8_t  e_ident[16];
+    uint16_t e_type, e_machine;
+    uint32_t e_version;
+    uint32_t e_entry, e_phoff, e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+};
+struct Elf32_Phdr {
+    uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
+};
+struct Elf32_Shdr {
+    uint32_t sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size;
+    uint32_t sh_link, sh_info, sh_addralign, sh_entsize;
+};
+#pragma pack(pop)
+
+constexpr uint32_t kPtLoad      = 1;
+constexpr uint32_t kPfX         = 1;
+constexpr uint32_t kPfW         = 2;
+constexpr uint32_t kShtProgbits = 1;
+constexpr uint32_t kShtStrtab   = 3;
+constexpr uint32_t kShfExecinstr = 4;
+
+struct PhdrLite { uint32_t type, flags; };
+struct ShdrLite { uint32_t type; uint64_t flags; uint64_t offset, size; };
+
+// 注入 / 无文件攻击常用符号
+const char* const kSuspiciousElfSymbols[] = {
+    "ptrace", "process_vm_writev", "process_vm_readv",
+    "memfd_create", "/proc/self/mem",
+};
+
+bool ContainsBytes(const char* hay, size_t hayLen, const char* needle, size_t nLen)
+{
+    if (nLen == 0 || hayLen < nLen) return false;
+    return std::search(hay, hay + hayLen, needle, needle + nLen) != hay + hayLen;
+}
+
+} // namespace
+
+bool HeuristicEngine::AnalyzeElf(const std::wstring& filePath, HeuristicResult& result) const {
+    std::ifstream file = OpenBinary(filePath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return false;
+    auto endPos = file.tellg();
+    if (endPos <= 0 || endPos > (std::streamoff)(256ull * 1024 * 1024)) return false;
+    size_t fileSize = (size_t)endPos;
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buf(fileSize);
+    if (!file.read((char*)buf.data(), (std::streamsize)fileSize)) return false;
+    if (fileSize < 64) return false;
+    if (buf[0] != 0x7F || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F') return false;
+    if (buf[4] != 1 && buf[4] != 2) return false;   // EI_CLASS: 1=32位 2=64位
+    if (buf[5] != 1) return false;                  // 仅支持小端序
+
+    bool is64 = (buf[4] == 2);
+    std::vector<PhdrLite> phdrs;
+    std::vector<ShdrLite> shdrs;
+
+    if (is64) {
+        if (fileSize < sizeof(Elf64_Ehdr)) return false;
+        Elf64_Ehdr eh;
+        std::memcpy(&eh, buf.data(), sizeof(eh));
+        if (eh.e_phoff && eh.e_phnum && eh.e_phentsize >= sizeof(Elf64_Phdr) &&
+            eh.e_phoff + (size_t)eh.e_phnum * eh.e_phentsize <= fileSize) {
+            for (uint16_t i = 0; i < eh.e_phnum; i++) {
+                Elf64_Phdr ph;
+                std::memcpy(&ph, buf.data() + eh.e_phoff + (size_t)i * eh.e_phentsize, sizeof(ph));
+                phdrs.push_back({ ph.p_type, ph.p_flags });
+            }
+        }
+        if (eh.e_shoff && eh.e_shnum && eh.e_shentsize >= sizeof(Elf64_Shdr) &&
+            eh.e_shoff + (size_t)eh.e_shnum * eh.e_shentsize <= fileSize) {
+            for (uint16_t i = 0; i < eh.e_shnum; i++) {
+                Elf64_Shdr sh;
+                std::memcpy(&sh, buf.data() + eh.e_shoff + (size_t)i * eh.e_shentsize, sizeof(sh));
+                shdrs.push_back({ sh.sh_type, sh.sh_flags, sh.sh_offset, sh.sh_size });
+            }
+        }
+    } else {
+        if (fileSize < sizeof(Elf32_Ehdr)) return false;
+        Elf32_Ehdr eh;
+        std::memcpy(&eh, buf.data(), sizeof(eh));
+        if (eh.e_phoff && eh.e_phnum && eh.e_phentsize >= sizeof(Elf32_Phdr) &&
+            eh.e_phoff + (size_t)eh.e_phnum * eh.e_phentsize <= fileSize) {
+            for (uint16_t i = 0; i < eh.e_phnum; i++) {
+                Elf32_Phdr ph;
+                std::memcpy(&ph, buf.data() + eh.e_phoff + (size_t)i * eh.e_phentsize, sizeof(ph));
+                phdrs.push_back({ ph.p_type, ph.p_flags });
+            }
+        }
+        if (eh.e_shoff && eh.e_shnum && eh.e_shentsize >= sizeof(Elf32_Shdr) &&
+            eh.e_shoff + (size_t)eh.e_shnum * eh.e_shentsize <= fileSize) {
+            for (uint16_t i = 0; i < eh.e_shnum; i++) {
+                Elf32_Shdr sh;
+                std::memcpy(&sh, buf.data() + eh.e_shoff + (size_t)i * eh.e_shentsize, sizeof(sh));
+                shdrs.push_back({ sh.sh_type, sh.sh_flags, sh.sh_offset, sh.sh_size });
+            }
+        }
+    }
+
+    int score = 0;
+    std::string reasons;
+
+    // 1) W^X 违规：存在既可写又可执行的可加载段（注入/自修改代码温床）
+    for (auto& ph : phdrs) {
+        if (ph.type == kPtLoad && (ph.flags & kPfW) && (ph.flags & kPfX)) {
+            score += 40;
+            reasons += "存在可写可执行段(W^X违规); ";
+            break;
+        }
+    }
+
+    // 2) 可执行节区熵异常（加密 payload / 加壳）
+    for (auto& sh : shdrs) {
+        if (sh.type == kShtProgbits && (sh.flags & kShfExecinstr) &&
+            sh.size > 0 && sh.offset + sh.size <= fileSize) {
+            double ent = ComputeEntropy(buf.data() + sh.offset, (size_t)sh.size);
+            if (ent > 7.2) {
+                score += 30;
+                reasons += "可执行节区熵异常(可能加密/加壳); ";
+                break;
+            }
+        }
+    }
+
+    // 3) 可疑动态符号
+    int symHits = 0;
+    for (auto& sh : shdrs) {
+        if (sh.type != kShtStrtab || sh.size == 0 || sh.offset + sh.size > fileSize)
+            continue;
+        const char* s = (const char*)(buf.data() + sh.offset);
+        for (const char* tok : kSuspiciousElfSymbols) {
+            if (ContainsBytes(s, (size_t)sh.size, tok, std::strlen(tok)))
+                symHits++;
+        }
+    }
+    if (symHits > 0) {
+        score += std::min(symHits * 15, 30);
+        reasons += "包含可疑动态符号(ptrace/memfd等); ";
+    }
+
+    if (score > 100) score = 100;
+    result.score = score;
+    result.suspicious = (score >= 30);
+    result.reason = reasons;
+    return true;
 }
 
 } // namespace yx

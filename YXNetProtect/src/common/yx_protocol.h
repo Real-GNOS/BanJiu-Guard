@@ -6,10 +6,11 @@
 #include <stdint.h>
 
 // CTL_CODE / METHOD_* / FILE_*_ACCESS 宏
-// 内核态由 ntifs.h/ntddk.h 提供；用户态需包含 winioctl.h
+// 内核态由 ntifs.h/ntddk.h 提供；Windows 用户态需包含 winioctl.h；
+// Linux 用户态（本协议仅用于共享结构体定义，不与驱动通信）提供等价占位定义。
 #ifdef _KERNEL_MODE
     // 内核态，宏已由 NT 头提供
-#else
+#elif defined(_WIN32)
     #ifndef _WIN32_WINNT
         #define _WIN32_WINNT 0x0A00
     #endif
@@ -19,6 +20,26 @@
     #include <windows.h>
     #include <winioctl.h>
     #include <fltUser.h>
+#else
+    // -------- Linux / 跨平台用户态 --------
+    #include <stdint.h>
+    // FILTER_MESSAGE_HEADER 在 Windows 由 fltUser.h 提供（与内核二进制布局一致）
+    typedef struct _FILTER_MESSAGE_HEADER {
+        uint32_t ReplyLength;
+        uint64_t MessageId;
+    } FILTER_MESSAGE_HEADER, *PFILTER_MESSAGE_HEADER;
+
+    // IOCTL 宏占位：Linux 端不发起设备 IOCTL，仅为保持头文件可编译
+    #ifndef CTL_CODE
+        #define CTL_CODE(DeviceType, Function, Method, Access) \
+            (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
+    #endif
+    #ifndef METHOD_BUFFERED
+        #define METHOD_BUFFERED 0
+    #endif
+    #ifndef FILE_ANY_ACCESS
+        #define FILE_ANY_ACCESS 0
+    #endif
 #endif
 
 // 驱动设备名与符号链接名
